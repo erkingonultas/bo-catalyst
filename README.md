@@ -2,3 +2,13 @@
 Bayesian Optimization for Catalyst Discovery
 
 <!-- TODO: crisp story + results gif  -->
+
+#### How to use
+```python
+python -m src.data.fetch_mp -e Ni,Cu --outfile data/raw_mp_thermo.parquet
+
+python -m src.data.fetch_ch --facet 111 -e Ni,Cu --outfile data/raw_catalysis_hub.parquet
+# optional: --reactants "~H" (contains) or "H*" (exact-ish), --chem "NiCu"
+
+python -m src.data.join_clean --ch data/raw_catalysis_hub.parquet --mp data/raw_mp_thermo.parquet --outfile data/processed.parquet
+```
