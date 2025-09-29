@@ -1,74 +1,87 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# Purpose: Fetch activity labels (ΔG_H* adsorption energies) from Catalysis-Hub
-#          for Ni–Cu (111) with adsorbed H.
+# Purpose: Fetch activity labels (reaction/adsorption energies) from Catalysis-Hub
+#          for Ni–Cu surfaces, with robust pagination + JSON parsing.
 # CLI:
-#   python -m src.data.fetch_ch --facet 111 --adsorbate H --elements Ni Cu \
-#       --outfile data/raw_catalysis_hub.parquet
+#   python -m src.data.fetch_ch --facet 111 -e Ni,Cu --outfile data/raw_catalysis_hub.parquet
+#   # optional: --reactants "~H" (contains) or "H*" (exact-ish), --chem "NiCu"
 # Notes:
-#   • Requires .env file for CATHUB_GRAPHQL_ENDPOINT (falls back to default)
-#   • Uses Catalysis-Hub public GraphQL endpoint
-#   • Paginates results; keeps a tidy schema; robust to partial fields
-#   • pip install httpx pandas typer pyarrow tenacity python-dotenv
+#   • Requires .env (python-dotenv). Default endpoint: http://api.catalysis-hub.org/graphql
+#   • Pagination uses `first` + `after` (cursor-based).
+#   • `reactants`, `products`, `sites` are JSONString in the schema → parse safely.
+#   • pip install httpx anyio tenacity pandas pyarrow typer python-dotenv pymatgen
 # ──────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
-import os
+import json
 import math
+import os
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
+import anyio
 import httpx
 import pandas as pd
 import typer
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pymatgen.core.composition import Composition
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 
 load_dotenv()
 
-CH_ENDPOINT = os.getenv("CATHUB_GRAPHQL_ENDPOINT", "https://api.catalysis-hub.org/graphql")
+# Per docs + tutorials, use HTTP endpoint; allow override via env
+CH_ENDPOINT = os.getenv("CATHUB_GRAPHQL_ENDPOINT", "http://api.catalysis-hub.org/graphql")
 
-ch_app = typer.Typer(help="Fetch adsorption energies from Catalysis-Hub via GraphQL.")
+app = typer.Typer(help="Fetch adsorption/reaction energies from Catalysis-Hub via GraphQL.")
 
 @dataclass
-class CHAdsorptionRow:
+class CHRow:
     record_id: str
     reaction_energy_eV: Optional[float]
-    # Context / metadata we expect to be commonly present
     surface_composition: Optional[str]
-    bulk_composition: Optional[str]
+    chemical_composition: Optional[str]
     facet: Optional[str]
     site: Optional[str]
-    adsorbates: Optional[str]
+    reactants: Optional[str]       # JSONString (raw)
+    products: Optional[str]        # JSONString (raw)
+    pub_id: Optional[str]
     publication_year: Optional[int]
-    # Derived
     reduced_formula: Optional[str]
     x_Ni: Optional[float]
     x_Cu: Optional[float]
+    adsorbates: Optional[str]      # derived short tag (e.g., "H*") for compatibility
 
 
 GRAPHQL_QUERY = """
-query Adsorption($limit: Int!, $offset: Int!, $facet: String, $ads: String, $elements: [String!]) {
+query Reactions(
+  $first: Int!,
+  $after: String,
+  $facet: String,
+  $chem: String,
+  $reactants: String,
+  $order: String
+) {
   reactions(
-    first: $limit,
-    offset: $offset,
-    filter: {
-      facet: $facet,
-      adsorbates: $ads,
-      elements: $elements
-    }
+    first: $first,
+    after: $after,
+    facet: $facet,
+    chemicalComposition: $chem,
+    reactants: $reactants,
+    order: $order
   ) {
     totalCount
+    pageInfo { endCursor hasNextPage }
     edges {
       node {
         id
         reactionEnergy
         facet
         sites
-        adsorbates
+        reactants
+        products
+        chemicalComposition
         surfaceComposition
-        bulkComposition
-        publicationYear
+        publication { year }
       }
     }
   }
@@ -76,100 +89,185 @@ query Adsorption($limit: Int!, $offset: Int!, $facet: String, $ads: String, $ele
 """
 
 
-class GQLRequestError(RuntimeError):
+class GQLError(RuntimeError):
     pass
 
 
-@retry(reraise=True, stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=8),
-       retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)))
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
+)
 async def _gql(client: httpx.AsyncClient, variables: Dict[str, Any]) -> Dict[str, Any]:
-    resp = await client.post(CH_ENDPOINT, json={"query": GRAPHQL_QUERY, "variables": variables}, timeout=60)
-    resp.raise_for_status()
+    headers = {"Content-Type": "application/json"}
+    resp = await client.post(
+        CH_ENDPOINT,
+        json={"query": GRAPHQL_QUERY, "variables": variables},
+        headers=headers,
+        timeout=60,
+    )
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        # Include response text for debug
+        raise httpx.HTTPStatusError(
+            f"{e} | body={resp.text[:400]}", request=e.request, response=e.response
+        )
     data = resp.json()
     if "errors" in data:
-        raise GQLRequestError(str(data["errors"]))
+        raise GQLError(str(data["errors"]))
     return data
 
+def _parse_elements_csv(elements_csv: str) -> List[str]:
+    return [e.strip() for e in (elements_csv or "").split(",") if e.strip()]
 
-@ch_app.command()
+
+def _has_h(js: Optional[str], strict_ads: bool) -> bool:
+    """Detect hydrogen presence in reactants/products JSONString."""
+    if not js:
+        return False
+    try:
+        d = json.loads(js)  # keys like "Hstar", "H2gas", etc.
+        keys = list(d.keys())
+        if strict_ads:
+            return any(k.lower().startswith("h") and "star" in k.lower() for k in keys)  # H* only
+        return any(k.lower().startswith("h") for k in keys)  # any H species
+    except Exception:
+        s = js or ""
+        return ("Hstar" in s) if strict_ads else ("H" in s)
+
+def _derive_composition_fields(surf: Optional[str]) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    if not surf:
+        return None, None, None
+    try:
+        comp = Composition(surf)
+        reduced = comp.reduced_formula
+        frac = comp.fractional_composition.get_el_amt_dict()
+        return reduced, float(frac.get("Ni", 0.0)), float(frac.get("Cu", 0.0))
+    except Exception:
+        return None, None, None
+
+@app.command()
 def main(
-    elements: List[str] = typer.Option(["Ni", "Cu"], help="Elements that must appear in the system."),
-    facet: str = typer.Option("111", help="Surface facet to filter."),
-    adsorbate: str = typer.Option("H", help="Adsorbate identifier (e.g., H, O, OH)."),
-    page_size: int = typer.Option(200, help="GraphQL page size."),
-    max_pages: int = typer.Option(200, help="Safety cap on pages to fetch."),
+    elements: str = typer.Option("Ni,Cu", "--elements", "-e",
+                                 help="Comma-separated elements used to focus client-side filtering (e.g., 'Ni,Cu')."),
+    facet: str = typer.Option("111", help="Surface facet filter (String)."),
+    reactants: str = typer.Option("~H", help="Server-side reactants filter; '~H' = contains H (docs cheat-sheet)."),
+    chem: Optional[str] = typer.Option(None, help="Server-side chemicalComposition filter, e.g. 'NiCu' or '~Ni'."),
+    order: str = typer.Option("chemicalComposition", help="Order field (String)."),
+    page_size: int = typer.Option(200, help="Page size (first)."),
+    max_pages: int = typer.Option(200, help="Safety cap on number of pages."),
     outfile: str = typer.Option("data/raw_catalysis_hub.parquet", help="Output Parquet path."),
+    strict_ads: bool = typer.Option(True, help="Keep only reactions with adsorbed hydrogen (H*)."),
     verbose: bool = typer.Option(True, help="Print progress."),
 ):
-    """Fetch adsorption/reaction energies for given filters from Catalysis-Hub."""
-    import anyio
+    """
+    Fetch reactions matching facet/chem/reactants via cursor pagination.
+    Then filter client-side for Ni&Cu (from --elements) and H/H* if requested.
+    """
+    el_list = _parse_elements_csv(elements)
+    want_Ni = "Ni" in el_list
+    want_Cu = "Cu" in el_list
+
+    # If chem arg not provided, derive a broad contains filter to reduce server load.
+    chem_arg = chem
+    if chem_arg is None and want_Ni:
+        chem_arg = "~Ni"  # documented "~" contains operator in CLI/tutorials
 
     async def run() -> pd.DataFrame:
         async with httpx.AsyncClient() as client:
-            # First call to get totalCount
-            vars0 = {"limit": page_size, "offset": 0, "facet": facet, "ads": adsorbate, "elements": elements}
-            data0 = await _gql(client, vars0)
-            total = data0["data"]["reactions"]["totalCount"]
-            if verbose:
-                typer.echo(f"Matched {total} reactions in Catalysis-Hub.")
-            pages = min(max_pages, math.ceil(total / page_size)) if total else 0
+            after: Optional[str] = None
+            total: Optional[int] = None
+            all_edges: List[Dict[str, Any]] = []
 
-            all_edges = data0["data"]["reactions"]["edges"]
-            # Fetch remaining pages concurrently
-            async def fetch_page(p: int):
-                if p == 0:
-                    return []  # already have it
-                vars_p = {"limit": page_size, "offset": p * page_size, "facet": facet, "ads": adsorbate, "elements": elements}
-                data_p = await _gql(client, vars_p)
-                return data_p["data"]["reactions"]["edges"]
+            for _ in range(max_pages):
+                variables = {
+                    "first": page_size,
+                    "after": after,
+                    "facet": str(facet) if facet else None,
+                    "chem": chem_arg,
+                    "reactants": reactants,
+                    "order": order,
+                }
+                data = await _gql(client, variables)
+                block = data["data"]["reactions"]
+                if total is None:
+                    total = block.get("totalCount")
+                    if verbose:
+                        typer.echo(f"Matched ~{total} reactions (server-side). Scanning pages…")
+                edges = block.get("edges") or []
+                all_edges.extend(edges)
 
-            results = await anyio.gather(*[fetch_page(p) for p in range(1, pages)])
-            for chunk in results:
-                all_edges.extend(chunk)
+                page_info = block.get("pageInfo") or {}
+                if not page_info.get("hasNextPage"):
+                    break
+                after = page_info.get("endCursor")
 
-        # Normalize into rows
-        rows: list[CHAdsorptionRow] = []
+        # Normalize + client-side filtering
+        rows: List[CHRow] = []
         for edge in all_edges:
             n = edge.get("node", {})
-            surf = n.get("surfaceComposition") or n.get("bulkComposition")
-            reduced = None
-            xNi = xCu = None
-            if surf:
-                try:
-                    reduced = Composition(surf).reduced_formula
-                    comp = Composition(surf).fractional_composition.get_el_amt_dict()
-                    xNi = float(comp.get("Ni", 0.0))
-                    xCu = float(comp.get("Cu", 0.0))
-                except Exception:
-                    pass
+
+            # H check
+            react_s, prod_s = n.get("reactants"), n.get("products")
+            if not (_has_h(react_s, strict_ads) or _has_h(prod_s, strict_ads)):
+                continue
+
+            # Choose best available composition string for join/derivation
+            surf = n.get("surfaceComposition") or n.get("chemicalComposition")
+            reduced, xNi, xCu = _derive_composition_fields(surf)
+
+            # Enforce Ni & Cu (client-side)
+            if want_Ni and (xNi or 0.0) <= 0.0:
+                continue
+            if want_Cu and (xCu or 0.0) <= 0.0:
+                continue
+
+            pub = n.get("publication") or {}
+            pub_year = pub.get("year") if isinstance(pub, dict) else None
+
             rows.append(
-                CHAdsorptionRow(
+                CHRow(
                     record_id=str(n.get("id")),
                     reaction_energy_eV=(float(n["reactionEnergy"]) if n.get("reactionEnergy") is not None else None),
-                    surface_composition=surf,
-                    bulk_composition=n.get("bulkComposition"),
+                    surface_composition=n.get("surfaceComposition"),
+                    chemical_composition=n.get("chemicalComposition"),
                     facet=n.get("facet"),
                     site=(n.get("sites") if isinstance(n.get("sites"), str) else None),
-                    adsorbates=n.get("adsorbates"),
-                    publication_year=(int(n["publicationYear"]) if n.get("publicationYear") is not None else None),
+                    reactants=react_s,
+                    products=prod_s,
+                    pub_id=n.get("pubId"),
+                    publication_year=(int(pub_year) if pub_year is not None else None),
                     reduced_formula=reduced,
                     x_Ni=xNi,
                     x_Cu=xCu,
+                    adsorbates=("H*" if _has_h(react_s, True) or _has_h(prod_s, True) else None),
                 )
             )
+
         df = pd.DataFrame([r.__dict__ for r in rows])
         if not df.empty:
             df.insert(0, "source", "catalysis_hub")
+            # Normalize facet like "111"
+            if "facet" in df.columns:
+                df["facet"] = df["facet"].astype(str).str.replace(r"[^0-9]", "", regex=True)
         return df
 
     df = anyio.run(run)
 
     os.makedirs(os.path.dirname(outfile), exist_ok=True)
     df.to_parquet(outfile, index=False)
+
     if verbose:
         typer.echo(f"Wrote {len(df)} rows → {outfile}")
+        if not df.empty:
+            dtypes = {k: str(v) for k, v in df.dtypes.to_dict().items()}
+            preview_cols = ["record_id", "reduced_formula", "facet", "reaction_energy_eV", "x_Ni", "x_Cu", "adsorbates"]
+            typer.echo("Schema:\n" + json.dumps(dtypes, indent=2))
+            typer.echo("Preview cols: " + ", ".join([c for c in preview_cols if c in df.columns]))
 
 
 if __name__ == "__main__":
-    ch_app()
+    app()
 

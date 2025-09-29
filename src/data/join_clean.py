@@ -81,7 +81,7 @@ def main(
         "E_ads_eV": merged.get("E_ads_eV"),
         "formation_energy_eV_per_atom": merged.get("formation_energy_eV_per_atom"),
         "energy_above_hull_eV": merged.get("energy_above_hull_eV_per_atom"),
-        "feasible": (merged.get("energy_above_hull_eV_per_atom") <= e_hull_feasible),
+        "feasible": (merged.get("energy_above_hull_eV_per_atom") <= e_hull_feasible), # type: ignore
         "x_Ni": merged.get("x_Ni_ch", merged.get("x_Ni")),
         "x_Cu": merged.get("x_Cu_ch", merged.get("x_Cu")),
         "mp_material_id": merged.get("material_id"),
