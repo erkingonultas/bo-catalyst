@@ -2,7 +2,14 @@
 # Purpose: Fetch activity labels (reaction/adsorption energies) from Catalysis-Hub
 #          for Ni–Cu surfaces, with robust pagination + JSON parsing.
 # CLI:
-#   python -m src.data.fetch_ch --facet 111 -e Ni,Cu --outfile data/raw_catalysis_hub.parquet
+#   python -m src.data.fetch_ch \
+#                --facet "" -e Ni,Cu \
+#                --no-strict-ads \
+#                --require-both \
+#                --element-source either \
+#                --keep-unknown-comp \
+#                --outfile data/ch_all_facets_either_keepUnknown_v2.parquet \
+#                --verbose
 #   # optional: --reactants "~H" (contains) or "H*" (exact-ish), --chem "NiCu"
 # Notes:
 #   • Requires .env (python-dotenv). Default endpoint: http://api.catalysis-hub.org/graphql
@@ -15,6 +22,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -143,22 +151,81 @@ def _has_h(js: Optional[str], strict_ads: bool) -> bool:
             return ("h*" in s) or ("*h" in s) or ("hstar" in s) or ("h(ads" in s)
         return "h" in s
 
-def _derive_composition_fields(surf: Optional[str]) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    if not surf:
-        return None, None, None
-    try:
-        comp = Composition(surf)
-        reduced = comp.reduced_formula
-        frac = comp.fractional_composition.get_el_amt_dict()
-        return reduced, float(frac.get("Ni", 0.0)), float(frac.get("Cu", 0.0))
-    except Exception:
-        return None, None, None
+# ------------------------ Composition parsing helpers ------------------------
+_COMPOSITION_TOKEN = re.compile(r"([A-Z][a-z]?)([0-9]*\.?[0-9]*)")
+
+def _regex_parse_formula_to_fracs(s: str) -> Tuple[Optional[str], Optional[Dict[str, float]]]:
+    """Parse like 'NiCu', 'Ni1Cu3', 'Ni0.25Cu0.75' → (reduced, fractions dict).
+    Returns (None, None) on failure."""
+    if not s or not isinstance(s, str):
+        return None, None
+    s_clean = s.strip()
+    if not s_clean:
+        return None, None
+    tokens = _COMPOSITION_TOKEN.findall(s_clean)
+    if not tokens:
+        return None, None
+    counts: Dict[str, float] = {}
+    for el, num in tokens:
+        if not el:
+            continue
+        try:
+            val = float(num) if num else 1.0
+        except Exception:
+            return None, None
+        counts[el] = counts.get(el, 0.0) + val
+    total = sum(counts.values())
+    if total <= 0:
+        return None, None
+    fracs = {el: cnt / total for el, cnt in counts.items()}
+    # Simple display reduced formula (alphabetical order). Not a strict chemical reduction.
+    def _fmt(cnt: float) -> str:
+        if abs(cnt - round(cnt)) < 1e-6:
+            return str(int(round(cnt)))
+        return f"{cnt:.3g}"
+    # scale so smallest nonzero ~1 for nicer integers where possible
+    min_nz = min(fracs.values())
+    scale = 1.0 / min_nz if min_nz > 0 else 1.0
+    scaled = {el: fracs[el] * scale for el in fracs}
+    if max(scaled.values()) > 50:  # avoid huge numbers
+        reduced = "".join(f"{el}{_fmt(fracs[el])}" for el in sorted(fracs))
+    else:
+        reduced = "".join(f"{el}{_fmt(scaled[el])}" for el in sorted(scaled))
+    return reduced, fracs
+
+def _derive_composition_fields(surf: Optional[str], chem: Optional[str] = None) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    """Try multiple fields/strategies to recover reduced formula and Ni/Cu fractions.
+    Priority: pymatgen on surface → pymatgen on chem → regex on either.
+    """
+    candidates = [surf, chem]
+    # 1) Try pymatgen Composition on candidates
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            comp = Composition(str(cand))
+            reduced = comp.reduced_formula
+            frac = comp.fractional_composition.get_el_amt_dict()
+            return reduced, float(frac.get("Ni")) if "Ni" in frac else None, float(frac.get("Cu")) if "Cu" in frac else None
+        except Exception:
+            pass
+    # 2) Regex fallback on candidates
+    for cand in candidates:
+        if not cand:
+            continue
+        reduced, fracs = _regex_parse_formula_to_fracs(str(cand))
+        if fracs:
+            return reduced, fracs.get("Ni"), fracs.get("Cu")
+    return None, None, None
+
+# ------------------------ System-element extraction -------------------------
 
 def _split_elements_from_string(s: str) -> set:
     """Extract element symbols like Ni, Cu, H from strings e.g. 'NiCuH', 'Ni Cu H'."""
     if not s:
         return set()
-    return set(re.findall(r'[A-Z][a-z]?', s))
+    return set(re.findall(r"[A-Z][a-z]?", s))
+
 
 def _extract_system_elements(node: dict) -> set:
     """Collect elements from multiple possible fields on a reaction node."""
@@ -206,7 +273,17 @@ def main(
     chem_arg = chem
     if chem_arg is None and want_Ni:
         chem_arg = "~Ni"  # documented "~" contains operator in CLI/tutorials
-    stats = {"total_edges": 0, "drop_no_H": 0, "drop_comp_parse": 0, "drop_elements": 0, "kept": 0, "drop_comp_unknown": 0, "kept_unknown_comp": 0 }
+
+    stats = {
+        "total_edges": 0,
+        "drop_no_H": 0,
+        "drop_comp_parse": 0,
+        "drop_elements": 0,
+        "kept": 0,
+        "drop_comp_unknown": 0,
+        "kept_unknown_comp": 0,
+    }
+
     async def run() -> pd.DataFrame:
         async with httpx.AsyncClient() as client:
             after: Optional[str] = None
@@ -238,7 +315,7 @@ def main(
 
         # Normalize + client-side filtering
         rows: List[CHRow] = []
-        
+
         for edge in all_edges:
             stats["total_edges"] += 1
             n = edge.get("node", {})
@@ -249,17 +326,20 @@ def main(
                 stats["drop_no_H"] += 1
                 continue
 
-            # Choose best available composition string for join/derivation
-            surf = n.get("surfaceComposition") or n.get("chemicalComposition")
-            reduced, xNi, xCu = _derive_composition_fields(surf)
-            
-            # Track composition parse issues
-            if reduced is None and not surf:
+            # Choose best available composition strings
+            surf_str = n.get("surfaceComposition")
+            chem_str = n.get("chemicalComposition")
+            reduced, xNi, xCu = _derive_composition_fields(surf_str, chem_str)
+            if reduced is None:
+                # we attempted parsing and failed (or had no strings)
                 stats["drop_comp_parse"] += 1
+
             # Enforce element presence per flag
             comp_known = (xNi is not None) or (xCu is not None)
 
-            want = set([e for e in (elements or []) if e])  # e.g., {"Ni","Cu"}
+            # >>> IMPORTANT: use parsed element list (not raw string)
+            want = set(el_list)  # e.g., {"Ni","Cu"}
+
             present_comp = {e: False for e in want}
             if comp_known:
                 if "Ni" in want:
@@ -276,7 +356,7 @@ def main(
                 return all(present[e] for e in want) if require_both else any(present[e] for e in want)
 
             ok_comp = ok_with(present_comp) if comp_known else False
-            ok_sys  = ok_with(present_sys)
+            ok_sys = ok_with(present_sys)
 
             use = element_source.lower().strip()
             if use == "composition":
@@ -303,11 +383,6 @@ def main(
                         stats["drop_elements"] += 1
                         continue
 
-            # If we get here, the row passes the element filter
-            # row["comp_known"] = bool(comp_known)
-            # row["element_source_used"] = use
-            # row["system_elements"] = sorted(sys_els) if sys_els else None
-
             pub = n.get("publication") or {}
             pub_year = pub.get("year") if isinstance(pub, dict) else None
 
@@ -316,8 +391,8 @@ def main(
                 CHRow(
                     record_id=str(n.get("id")),
                     reaction_energy_eV=(float(n["reactionEnergy"]) if n.get("reactionEnergy") is not None else None),
-                    surface_composition=n.get("surfaceComposition"),
-                    chemical_composition=n.get("chemicalComposition"),
+                    surface_composition=surf_str,
+                    chemical_composition=chem_str,
                     facet=n.get("facet"),
                     site=(n.get("sites") if isinstance(n.get("sites"), str) else None),
                     reactants=react_s,
@@ -325,8 +400,8 @@ def main(
                     pub_id=n.get("pubId"),
                     publication_year=(int(pub_year) if pub_year is not None else None),
                     reduced_formula=reduced,
-                    x_Ni=xNi,
-                    x_Cu=xCu,
+                    x_Ni=(float(xNi) if xNi is not None else None),
+                    x_Cu=(float(xCu) if xCu is not None else None),
                     adsorbates=("H*" if _has_h(react_s, True) or _has_h(prod_s, True) else None),
                 )
             )
@@ -337,6 +412,11 @@ def main(
             # Normalize facet like "111"
             if "facet" in df.columns:
                 df["facet"] = df["facet"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            # Ensure numeric types for composition fractions
+            if "x_Ni" in df.columns:
+                df["x_Ni"] = pd.to_numeric(df["x_Ni"], errors="coerce")
+            if "x_Cu" in df.columns:
+                df["x_Cu"] = pd.to_numeric(df["x_Cu"], errors="coerce")
         return df
 
     df = anyio.run(run)
@@ -356,4 +436,3 @@ def main(
 
 if __name__ == "__main__":
     app()
-
