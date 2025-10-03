@@ -5,7 +5,10 @@ Bayesian Optimization for Catalyst Discovery
 
 #### How to use
 ```python
-python -m src.data.fetch_mp -e Ni,Cu --outfile data/raw_mp_thermo.parquet
+# Fetch data
+
+python -m src.data.fetch_mp_improved -e Ni,Cu -o data/test_mp.parquet \
+    --eah-max 1.0 --include-unstable
 
 python -m src.data.fetch_ch \
         --facet "" -e Ni,Cu \
@@ -13,10 +16,11 @@ python -m src.data.fetch_ch \
         --require-both \
         --element-source either \
         --keep-unknown-comp \
-        --outfile data/ch_all_facets_either_keepUnknown_v2.parquet \
+        --outfile data/raw_catalysis_hub.parquet \
         --verbose 
 # optional: --reactants "~H" (contains) or "H*" (exact-ish), --chem "NiCu"
 
+# Combine both to create a dataset
 python -m src.data.join_clean --ch data/raw_catalysis_hub.parquet --mp data/raw_mp_thermo.parquet --outfile data/processed.parquet
 
 # 1) (optional) regenerate BO dataset if needed
