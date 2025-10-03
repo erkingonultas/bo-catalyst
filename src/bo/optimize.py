@@ -25,7 +25,7 @@ from botorch.utils.multi_objective.box_decompositions import NondominatedPartiti
 from gpytorch.mlls import ExactMarginalLogLikelihood, SumMarginalLogLikelihood
 from botorch.models.transforms import Standardize, Normalize
 
-bo_app = typer.Typer(help="Run multi‑objective BO on Ni–Cu composition (x in [0,1]).")
+bo_app = typer.Typer(help="Run multi-objective BO on Ni-Cu composition (x in [0,1]).")
 
 
 def _to_tensor(df: pd.DataFrame) -> Tuple[torch.Tensor, torch.Tensor]:
