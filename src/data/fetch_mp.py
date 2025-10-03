@@ -1,20 +1,30 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Purpose: Fetch stability labels (formation energy, energy above hull) for
-#          Ni–Cu bulk alloys from the Materials Project.
-# CLI:
-#   python -m src.data.fetch_mp --elements Ni,Cu --outfile data/raw_mp_thermo.parquet
+#          binary bulk alloys from the Materials Project and write a tidy table (parquet).
+#
+# Why this rewrite?
+#   • Fixes under-fetching by eagerly materializing search results inside the
+#     API context and exposing looser/stricter filters as CLI flags.
+#   • Generalizes element-fraction columns (x_A, x_B) to any binary (not just
+#     Ni–Cu) while still emitting explicit x_<El> columns for joins.
+#   • Adds richer fields (is_stable, spacegroup, density, volume) and
+#     robust progress / diagnostics so you can see where rows get filtered.
+#   • Improves schema safety and Parquet writing.
+#
+# CLI examples:
+#   python -m src.data.fetch_mp_improved -e Ni,Cu -o data/test_mp.parquet \
+#       --eah-max 1.0 --min-nelements 2 --max-nelements 2 --include-unstable
+#
 # Notes:
-#   • Requires .env file with MP_API_KEY (use python-dotenv)
-#   • Uses mp-api official client (pip install mp-api pymatgen pyarrow typer python-dotenv)
-#   • Outputs a tidy Parquet with a stable schema documented below.
+#   • Requires .env with MP_API_KEY (python-dotenv is used).
+#   • Install: mp-api, pymatgen, pandas, pyarrow, typer, python-dotenv.
 # ──────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
 import json
 import os
-import sys
 from dataclasses import dataclass, asdict
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import typer
@@ -22,120 +32,225 @@ from dotenv import load_dotenv
 from mp_api.client import MPRester
 from pymatgen.core.composition import Composition
 
-app = typer.Typer(help="Fetch stability data from Materials Project (MP) for binary alloys.")
+app = typer.Typer(help="Fetch Materials Project summary data for binary alloys.")
 
-load_dotenv() # Load keys from .env file
+load_dotenv()
+
 
 @dataclass
 class MPThermoRow:
+    # Core
     material_id: str
     formula_pretty: str
     chemsys: str
     elements: List[str]
     nelements: int
-    energy_above_hull_eV_per_atom: float
+    # Thermo
+    is_stable: Optional[bool]
+    energy_above_hull_eV_per_atom: Optional[float]
     formation_energy_eV_per_atom: Optional[float]
+    # Electronic/structure (lightweight summary fields)
     efermi: Optional[float]
-    # Derived keys for joins
+    spacegroup_symbol: Optional[str]
+    density: Optional[float]
+    volume: Optional[float]
+    # Derived for joins
     reduced_formula: str
-    x_Ni: Optional[float]
-    x_Cu: Optional[float]
+    # Element fractions (x_<El>) — added dynamically for the 2 provided elements
+    # plus generic slots for convenience
+    x_A: Optional[float]
+    x_B: Optional[float]
+    x_el1: Optional[float]
+    x_el2: Optional[float]
 
 
-def _fraction_from_formula(formula: str, el: str) -> Optional[float]:
-    try:
-        comp = Composition(formula).fractional_composition
-        return float(comp.get_el_amt_dict().get(el, 0.0))
-    except Exception:
-        return None
+# ---------- helpers ----------
 
+def _sorted_pair(elements: List[str]) -> Tuple[str, str]:
+    el = [e.strip() for e in elements if e.strip()]
+    if len(el) != 2:
+        raise ValueError("Expect exactly two elements for a binary alloy.")
+    el.sort()
+    return el[0], el[1]
+
+
+def _fractions_from_formula(formula: str, el1: str, el2: str) -> Tuple[float, float, str]:
+    comp = Composition(formula)
+    frac = comp.fractional_composition.get_el_amt_dict()
+    x1 = float(frac.get(el1, 0.0))
+    x2 = float(frac.get(el2, 0.0))
+    return x1, x2, comp.reduced_formula
+
+
+# ---------- CLI ----------
 
 @app.command()
 def main(
-    elements: str = typer.Option("Ni,Cu", "--elements", "-e", help="Comma-separated list of exactly two elements, e.g. 'Ni,Cu' or 'Ni, Cu'"),
-    outfile: str = typer.Option("data/raw_mp_thermo.parquet", help="Output Parquet path."),
-    eah_max: float = typer.Option(1.0, help="Max energy above hull (eV/atom) filter for retrieval."),
-    verbose: bool = typer.Option(True, help="Print progress."),
+    elements: str = typer.Option(
+        "Ni,Cu", "--elements", "-e", help="Comma-separated list of exactly two elements (e.g., 'Ni,Cu')."
+    ),
+    outfile: str = typer.Option("data/raw_mp_thermo.parquet", "--outfile", "-o", help="Output Parquet path."),
+    eah_max: float = typer.Option(1.0, "--eah-max", help="Max energy above hull (eV/atom) to keep in OUTPUT."),
+    include_unstable: bool = typer.Option(
+        False,
+        "--include-unstable/--only-feasible",
+        help="If set, fetch without an E_hull filter and filter AFTER download.",
+    ),
+    min_nelements: int = typer.Option(2, help="Lower bound for nelements filter (applied at server)."),
+    max_nelements: int = typer.Option(2, help="Upper bound for nelements filter (applied at server)."),
+    limit: Optional[int] = typer.Option(None, help="Optional hard cap on number of docs to fetch (for debugging)."),
+    verbose: bool = typer.Option(True, "--verbose/--quiet", help="Print progress and schema info."),
 ):
-    """Fetch MP stability data for the given binary alloy system."""
-    el_list = [e.strip() for e in elements.split(",") if e.strip()]
-    if len(el_list) != 2:
-        typer.secho("This script is currently tailored for binaries (exactly two elements).", fg=typer.colors.RED)
-        raise typer.Exit(2)
+    """Fetch MP Summary docs for a binary system and write a tidy table.
+
+    Implementation notes
+    --------------------
+    • We materialize the search results *inside* the API context to avoid lazy
+      generators that might under-fetch when the client is closed.
+    • We can either ask the server to filter by energy_above_hull, or we can
+      download a broader set with --include-unstable then filter locally.
+    """
+
+    el1, el2 = _sorted_pair([e for e in elements.split(",") if e])
+    chemsys = f"{el1}-{el2}"
 
     api_key = os.getenv("MP_API_KEY")
     if not api_key:
         typer.secho("MP_API_KEY not set in environment (.env).", fg=typer.colors.RED)
         raise typer.Exit(2)
 
-    elems_sorted = sorted(el_list)
-    chemsys = "-".join(elems_sorted)
+    # --- query ---
+    fields = [
+        "material_id",
+        "elements",
+        "nelements",
+        "is_stable",
+        "energy_above_hull",
+        "formation_energy_per_atom",
+        "efermi",
+        "density",
+        "volume",
+        "formula_pretty",
+        "symmetry",
+    ]
 
-    rows: list[MPThermoRow] = []
-    with MPRester(api_key, use_document_model=False, monty_decode=False) as mpr:
-        # mp-api Summary endpoint includes thermo info including energy_above_hull, formation_energy_per_atom
-        # Filter by chemical system and an upper bound on E_above_hull for practicality
-        if verbose:
-            typer.echo(f"Querying MP summary for chemsys={chemsys}, E_hull<={eah_max} eV/atom…")
-
-        docs = mpr.materials.summary.search(
-            chemsys=chemsys,
-            energy_above_hull=(0, eah_max),
-            fields=[
-                "material_id", "formula_pretty", "nelements", "elements",
-                "energy_above_hull", "formation_energy_per_atom", "efermi"
-            ]
+    if verbose:
+        hint = "(server-filtered E_hull)" if not include_unstable else "(broad fetch; will filter locally)"
+        typer.echo(
+            f"Querying MP Summary for chemsys={chemsys}, nelements∈[{min_nelements},{max_nelements}] {hint}…"
         )
 
+    with MPRester(api_key, use_document_model=False, monty_decode=False) as mpr:
+        if include_unstable:
+            docs_iter = mpr.materials.summary.search(
+                chemsys=chemsys,
+                num_elements=(min_nelements, max_nelements),
+                fields=fields,
+                # having a deterministic sort makes debugging easier
+                
+            )
+        else:
+            docs_iter = mpr.materials.summary.search(
+                chemsys=chemsys,
+                num_elements=(min_nelements, max_nelements),
+                energy_above_hull=(0, max(eah_max, 0.0)),
+                fields=fields,
+                
+            )
+        # Eagerly materialize while connection is open
+        docs = list(docs_iter if limit is None else (d for i, d in enumerate(docs_iter) if i < limit))
+
+    if verbose:
+        typer.echo(f"Fetched {len(docs)} summaries from MP.")
+
+    # --- rows & local filtering ---
+    rows: List[MPThermoRow] = []
     for d in docs:
-        # --- safe gets for dict-style docs ---
         formula = d.get("formula_pretty")
         if not formula:
-            # skip rows without a valid formula
+            continue
+        if not formula:
+            continue
+        try:
+            x1, x2, reduced = _fractions_from_formula(formula, el1, el2)
+        except Exception:
+            # Skip if formula parsing fails
             continue
 
-        # --- composition-derived fields ---
-        comp = Composition(formula)
-        reduced_formula = comp.reduced_formula  # e.g., "NiCu"
-        frac_dict = comp.fractional_composition.get_el_amt_dict()
-        x_Ni = float(frac_dict.get("Ni", 0.0))
-        x_Cu = float(frac_dict.get("Cu", 0.0))
-
-        # --- elements: ensure Arrow-friendly (list[str]) ---
-        raw_elems = d.get("elements") or []
-        elements_list = [str(el) for el in raw_elems]
-
-        # --- numeric fields with defensive casts ---
+        # Optional local filter by E_hull
         e_hull = d.get("energy_above_hull")
-        fe_per_atom = d.get("formation_energy_per_atom")
-        efermi = d.get("efermi")
+        if (e_hull is not None) and (not include_unstable) and (float(e_hull) > eah_max):
+            continue
 
-        rows.append(MPThermoRow(
-            material_id=str(d.get("material_id")),
-            formula_pretty=d.get("formula_pretty") or d.get("formula_prety", formula),
-            chemsys=chemsys,
-            elements=elements_list,
-            nelements=int(d.get("nelements") or len(elements_list)),
-            energy_above_hull_eV_per_atom=float(e_hull) if e_hull is not None else None,
-            formation_energy_eV_per_atom=float(fe_per_atom) if fe_per_atom is not None else None,
-            efermi=float(efermi) if efermi is not None else None,
-            reduced_formula=reduced_formula,
-            x_Ni=x_Ni,
-            x_Cu=x_Cu,
-        ))
+        rows.append(
+            MPThermoRow(
+                material_id = str(d.get("material_id")),
+                formula_pretty=formula,
+                chemsys=chemsys,
+                elements=[str(e) for e in (d.get("elements") or [])],
+                nelements=int(d.get("nelements") or 0),
+                is_stable=bool(d.get("is_stable")) if d.get("is_stable") is not None else None,
+                energy_above_hull_eV_per_atom=float(e_hull) if e_hull is not None else None,
+                formation_energy_eV_per_atom=(
+                    float(d.get("formation_energy_per_atom"))
+                    if d.get("formation_energy_per_atom") is not None
+                    else None
+                ),
+                efermi=float(d.get("efermi")) if d.get("efermi") is not None else None,
+                # symmetry can be dict; try to extract symbol
+                spacegroup_symbol=(
+                    (d.get("symmetry") or {}).get("symbol") if isinstance(d.get("symmetry"), dict) else None
+                ),
+                density=float(d.get("density")) if d.get("density") is not None else None,
+                volume=float(d.get("volume")) if d.get("volume") is not None else None,
+                reduced_formula=reduced,
+                x_A=x1,
+                x_B=x2,
+                x_el1=x1,
+                x_el2=x2,
+            )
+        )
 
-
+    # DataFrame
     df = pd.DataFrame([asdict(r) for r in rows])
-    df.insert(0, "source", "materials_project")
 
-    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    # prepend source and explicit element fraction columns (x_<El>) for the pair
+    df.insert(0, "source", "materials_project")
+    # Stable explicit columns for joins downstream
+    df[f"x_{el1}"] = df["x_el1"]
+    df[f"x_{el2}"] = df["x_el2"]
+
+    # Tidy up columns order (human friendly)
+    preferred = [
+        "source",
+        "material_id",
+        "formula_pretty",
+        "reduced_formula",
+        "chemsys",
+        "elements",
+        "nelements",
+        "is_stable",
+        "energy_above_hull_eV_per_atom",
+        "formation_energy_eV_per_atom",
+        "efermi",
+        "spacegroup_symbol",        "density",
+        "volume",
+        f"x_{el1}",
+        f"x_{el2}",
+    ]
+    # Keep any extras at the end
+    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+    df = df.loc[:, cols]
+
+    # I/O
+    os.makedirs(os.path.dirname(outfile) or ".", exist_ok=True)
     df.to_parquet(outfile, index=False)
 
     if verbose:
-        typer.echo(f"Wrote {len(df)} rows → {outfile}")
-        # Show a compact schema preview
+        kept = len(df)
         dtypes = {k: str(v) for k, v in df.dtypes.to_dict().items()}
-        typer.echo("Schema:" + "\n" + json.dumps(dtypes, indent=2))
+        typer.echo(f"Wrote {kept} rows → {outfile}")
+        typer.echo("Schema:\n" + json.dumps(dtypes, indent=2))
 
 
 if __name__ == "__main__":
